@@ -1,32 +1,4 @@
-def create_subgraph(self, nk_graph: nk.Graph, nodes: Set[int]) -> Tuple[nk.Graph, Dict[int, int]]:
-        """
-        Create NetworKit subgraph for a given set of nodes with node remapping.
-        
-        Args:
-            nk_graph: Original NetworKit graph
-            nodes: Set of nodes to include in subgraph
-            
-        Returns:
-            Tuple of (NetworKit subgraph, reverse node mapping dict)
-        """
-        # Create a mapping from old node IDs to new sequential IDs
-        node_list = sorted(list(nodes))
-        node_mapping = {old_id: new_id for new_id, old_id in enumerate(node_list)}
-        reverse_mapping = {new_id: old_id for old_id, new_id in node_mapping.items()}
-        
-        # Create new NetworKit graph with remapped nodes
-        nk_subgraph = nk.Graph(len(nodes), weighted=True)
-        
-        # Add edges to the new graph
-        for old_u in nodes:
-            for old_v in nk_graph.iterNeighbors(old_u):
-                if old_v in nodes and old_u < old_v:  # Avoid duplicate edges
-                    new_u = node_mapping[old_u]
-                    new_v = node_mapping[old_v]
-                    weight = nk_graph.weight(old_u, old_v)
-                    nk_subgraph.addEdge(new_u, new_v, weight)
-        
-        return nk_subgraph, reverse_mappingimport numpy as np
+
 from sklearn.metrics.pairwise import cosine_similarity
 import networkit as nk
 from typing import List, Dict, Tuple, Set
@@ -104,6 +76,38 @@ class HierarchicalClustering:
         
         return nk_graph
     
+    def create_subgraph(self, nk_graph: nk.Graph, nodes: Set[int]) -> Tuple[nk.Graph, Dict[int, int]]:
+            """
+            Create NetworKit subgraph for a given set of nodes with node remapping.
+            
+            Args:
+                nk_graph: Original NetworKit graph
+                nodes: Set of nodes to include in subgraph
+                
+            Returns:
+                Tuple of (NetworKit subgraph, reverse node mapping dict)
+            """
+            # Create a mapping from old node IDs to new sequential IDs
+            node_list = sorted(list(nodes))
+            node_mapping = {old_id: new_id for new_id, old_id in enumerate(node_list)}
+            reverse_mapping = {new_id: old_id for old_id, new_id in node_mapping.items()}
+            
+            # Create new NetworKit graph with remapped nodes
+            nk_subgraph = nk.Graph(len(nodes), weighted=True)
+            
+            # Add edges to the new graph
+            for old_u in nodes:
+                for old_v in nk_graph.iterNeighbors(old_u):
+                    if old_v in nodes and old_u < old_v:  # Avoid duplicate edges
+                        new_u = node_mapping[old_u]
+                        new_v = node_mapping[old_v]
+                        weight = nk_graph.weight(old_u, old_v)
+                        nk_subgraph.addEdge(new_u, new_v, weight)
+            
+            return nk_subgraph, reverse_mappingimport numpy as np
+
+
+
     def detect_communities(self, nk_graph: nk.Graph) -> Tuple[List[Set[int]], float]:
         """
         Detect communities in the graph using NetworKit's Louvain method.
