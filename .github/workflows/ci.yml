@@ -71,6 +71,8 @@ jobs:
           tar -xvjf micromamba.tar.bz2 -C $HOME/bin --strip-components=1 bin/micromamba
           chmod +x $HOME/bin/micromamba
           echo "$HOME/bin" >> $GITHUB_PATH
+          # Make micromamba available in this same step (GITHUB_PATH entries take effect in subsequent steps)
+          export PATH="$HOME/bin:$PATH"
           micromamba --version
 
       - name: Create env from environment.yml
