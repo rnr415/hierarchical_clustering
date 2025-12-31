@@ -64,14 +64,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-micromamba-pkgs-
 
-      - name: Setup micromamba
-        uses: mamba-org/micromamba-action@v1
-        with:
-          shell: bash
-          # do not create env via action; we'll create from environment.yml for reproducibility
-          envName: vec2gc
-          channels: conda-forge
-          specs: "python=3.9"
+      - name: Install micromamba binary
+        run: |
+          mkdir -p $HOME/bin
+          curl -L "https://micromamba.snakepit.net/api/micromamba/linux-64/latest" -o micromamba.tar.bz2
+          tar -xvjf micromamba.tar.bz2 -C $HOME/bin --strip-components=1 bin/micromamba
+          chmod +x $HOME/bin/micromamba
+          echo "$HOME/bin" >> $GITHUB_PATH
+          micromamba --version
 
       - name: Create env from environment.yml
         run: |
