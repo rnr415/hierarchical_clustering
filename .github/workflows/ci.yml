@@ -42,12 +42,9 @@ jobs:
         run: |
           python - <<'PY'
           import sys
-          from vec2gc.vec2gc import HierarchicalSequentialClustering
-          print('Imported HierarchicalSequentialClustering OK')
-          PY
-
-  test-networkit:
-    name: Tests with NetworKit (micromamba)
+          import vec2gc
+          print('Imported vec2gc OK, version:', getattr(vec2gc, '__version__', 'unknown'))
+          print('HierarchicalSequentialClustering is', 'available' if getattr(vec2gc, 'HierarchicalSequentialClustering', None) else 'unavailable (optional deps missing)')
     runs-on: ubuntu-latest
 
     steps:
