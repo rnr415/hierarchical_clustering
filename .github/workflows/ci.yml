@@ -41,10 +41,10 @@ jobs:
       - name: Smoke import
         run: |
           python - <<'PY'
-import sys
-from vec2gc.vec2gc import HierarchicalSequentialClustering
-print('Imported HierarchicalSequentialClustering OK')
-PY
+          import sys
+          from vec2gc.vec2gc import HierarchicalSequentialClustering
+          print('Imported HierarchicalSequentialClustering OK')
+          PY
 
   test-networkit:
     name: Tests with NetworKit (micromamba)
