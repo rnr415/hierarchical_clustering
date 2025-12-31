@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vec2gc"
+version = "0.1.0"
+description = "Memory-efficient hierarchical graph-based clustering for vector embeddings"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+# Replace with real author info if desired
+authors = [ { name = "Rajesh N Rao", email = "rnr415@gmail.com" } ]
+
+# Runtime dependencies (minimal core)
+dependencies = [
+    "numpy>=1.23",
+    "joblib",
+]
+
+[project.optional-dependencies]
+# Optional dependencies for working with text embeddings and large-scale experiments
+full = [
+    "sentence-transformers",
+    "datasets",
+    "torch",
+    "networkit"
+]
+# Testing & development
+dev = [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "isort",
+    "mypy",
+]
+
+[tool.setuptools.packages.find]
+# Using src-layout for packages
+where = ["src"]
+include = ["vec2gc*", "optim_vec2gc*"]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
