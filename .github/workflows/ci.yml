@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install package (dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+
+      - name: Run tests
+        run: |
+          pytest -q
+
+      - name: Smoke import
+        run: |
+          python - <<'PY'
+          import sys
+          import vec2gc
+          print('Imported vec2gc OK, version:', getattr(vec2gc, '__version__', 'unknown'))
+          print('HierarchicalSequentialClustering is', 'available' if getattr(vec2gc, 'HierarchicalSequentialClustering', None) else 'unavailable (optional deps missing)')
+          PY
+
+  test-networkit:
+    name: Tests with NetworKit (micromamba)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache micromamba package cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.micromamba_pkgs
+            ~/.local/share/micromamba/pkgs
+            ~/micromamba/pkgs
+          key: ${{ runner.os }}-micromamba-pkgs-${{ hashFiles('environment.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-micromamba-pkgs-
+
+      - name: Install micromamba binary
+        run: |
+          mkdir -p $HOME/bin
+          curl -L "https://micromamba.snakepit.net/api/micromamba/linux-64/latest" -o micromamba.tar.bz2
+          tar -xvjf micromamba.tar.bz2 -C $HOME/bin --strip-components=1 bin/micromamba
+          chmod +x $HOME/bin/micromamba
+          echo "$HOME/bin" >> $GITHUB_PATH
+          # Make micromamba available in this same step (GITHUB_PATH entries take effect in subsequent steps)
+          export PATH="$HOME/bin:$PATH"
+          micromamba --version
+
+      - name: Create env from environment.yml
+        run: |
+          micromamba create -f environment.yml -n vec2gc -y --yes
+
+      - name: Install project (already installed via pip in environment.yml pip section)
+        run: |
+          micromamba run -n vec2gc python -m pip install --upgrade pip
+
+      - name: Run tests with NetworKit
+        run: micromamba run -n vec2gc pytest -q
+
