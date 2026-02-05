@@ -1,10 +1,19 @@
 import numpy as np
 import networkit as nk
 from typing import List, Dict, Tuple, Set
-import joblib
-from joblib import Parallel, delayed
-import gc
 import warnings
+from vec2gc.graph_builders import (
+    normalize_embeddings,
+    create_graph_from_embeddings_streaming,
+    create_graph_from_embeddings_streaming_chunked,
+    create_graph_from_embeddings_faiss_hnsw,
+    create_graph_from_embeddings_faiss_flatip,
+)
+from vec2gc.recursive_clustering import (
+    create_subgraph,
+    detect_communities,
+    recursive_clustering,
+)
 warnings.filterwarnings('ignore')
 
 
@@ -44,8 +53,7 @@ class HierarchicalSequentialClustering:
         Returns:
             Normalized embeddings matrix (n x d)
         """
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        return embeddings / (norms + 1e-10)  # Avoid division by zero
+        return normalize_embeddings(embeddings)
     
     def compute_pairwise_similarity(self, emb_i: np.ndarray, emb_j: np.ndarray) -> float:
         """
@@ -72,24 +80,7 @@ class HierarchicalSequentialClustering:
         Returns:
             Tuple of (NetworKit subgraph, reverse node mapping dict)
         """
-        # Create a mapping from old node IDs to new sequential IDs
-        node_list = sorted(list(nodes))
-        node_mapping = {old_id: new_id for new_id, old_id in enumerate(node_list)}
-        reverse_mapping = {new_id: old_id for old_id, new_id in node_mapping.items()}
-        
-        # Create new NetworKit graph with remapped nodes
-        nk_subgraph = nk.Graph(len(nodes), weighted=True)
-        
-        # Add edges to the new graph
-        for old_u in nodes:
-            for old_v in nk_graph.iterNeighbors(old_u):
-                if old_v in nodes and old_u < old_v:  # Avoid duplicate edges
-                    new_u = node_mapping[old_u]
-                    new_v = node_mapping[old_v]
-                    weight = nk_graph.weight(old_u, old_v)
-                    nk_subgraph.addEdge(new_u, new_v, weight)
-        
-        return nk_subgraph, reverse_mapping
+        return create_subgraph(nk_graph, nodes)
     
     def create_graph_from_embeddings_streaming(self, embeddings: np.ndarray, 
                                                 batch_size: int = 1000) -> nk.Graph:
@@ -111,62 +102,11 @@ class HierarchicalSequentialClustering:
         Returns:
             NetworKit Graph object
         """
-        n_items = embeddings.shape[0]
-        
-        # Normalize embeddings once (reused for all comparisons)
-        print(f"Step 2.1: Normalizing embeddings...")
-        embeddings_norm = self.normalize_embeddings(embeddings)
-        print(f"Step 2.1: Done normalizing embeddings")
-        
-        # Create NetworKit graph
-        nk_graph = nk.Graph(n_items, weighted=True)
-        print(f"Step 2.2: Done initializing graph")
-        
-        # Batched streaming edge creation: compute similarities in batches
-        print(f"Step 2.3: Computing similarities and building graph (batched streaming mode, batch_size={batch_size})...")
-        epsilon = 1e-10
-        edges_added = 0
-        
-        # Iterate over rows (i)
-        for i in range(n_items):
-            emb_i = embeddings_norm[i]
-            
-            # Process similarities in batches for j > i
-            j_start = i + 1
-            j_end = n_items
-            
-            # Process in batches
-            for batch_start in range(j_start, j_end, batch_size):
-                batch_end = min(batch_start + batch_size, j_end)
-                
-                # Vectorized similarity computation for batch
-                # emb_i is shape (d,), embeddings_norm[batch_start:batch_end] is (batch_size, d)
-                # Result is shape (batch_size,) - similarities for all j in batch
-                similarities_batch = np.dot(embeddings_norm[batch_start:batch_end], emb_i)
-                
-                # Find valid edges in this batch (vectorized filtering)
-                valid_mask = similarities_batch > self.similarity_threshold
-                valid_indices = np.where(valid_mask)[0]
-                
-                if len(valid_indices) > 0:
-                    # Get valid similarities and compute weights (vectorized)
-                    valid_similarities = similarities_batch[valid_mask]
-                    weights_batch = 1.0 / (1.0 - valid_similarities + epsilon)
-                    
-                    # Get corresponding j indices
-                    valid_j_indices = batch_start + valid_indices
-                    
-                    # Add edges to graph
-                    for j, weight in zip(valid_j_indices, weights_batch):
-                        nk_graph.addEdge(int(i), int(j), float(weight))
-                        edges_added += 1
-            
-            # Progress indicator for large datasets
-            if (i + 1) % max(1, n_items // 10) == 0:
-                print(f"  Processed {i + 1}/{n_items} nodes, {edges_added} edges added so far...")
-        
-        print(f"Step 2.3: Done - added {edges_added} edges")
-        return nk_graph
+        return create_graph_from_embeddings_streaming(
+            embeddings,
+            similarity_threshold=self.similarity_threshold,
+            batch_size=batch_size
+        )
     
     def create_graph_from_embeddings_streaming_chunked(self, embeddings: np.ndarray, 
                                                       chunk_size: int = 1000,
@@ -189,86 +129,43 @@ class HierarchicalSequentialClustering:
         Returns:
             NetworKit Graph object
         """
-        n_items = embeddings.shape[0]
-        
-        # Normalize embeddings once (shared across all workers)
-        print(f"Step 2.1: Normalizing embeddings...")
-        embeddings_norm = self.normalize_embeddings(embeddings)
-        print(f"Step 2.1: Done normalizing embeddings")
-        
-        # Create NetworKit graph
-        nk_graph = nk.Graph(n_items, weighted=True)
-        
-        def process_chunk(start_idx):
-            """
-            Process a chunk of rows, computing similarities in batches.
-            Returns list of edges as (i, j, weight) tuples.
-            """
-            end_idx = min(start_idx + chunk_size, n_items)
-            edges = []
-            epsilon = 1e-10
-            
-            # Process each row in the chunk
-            for i in range(start_idx, end_idx):
-                emb_i = embeddings_norm[i]
-                
-                # Process similarities in batches for j > i
-                j_start = i + 1
-                j_end = n_items
-                
-                # Process in batches
-                for batch_start in range(j_start, j_end, batch_size):
-                    batch_end = min(batch_start + batch_size, j_end)
-                    
-                    # Vectorized similarity computation for batch
-                    similarities_batch = np.dot(embeddings_norm[batch_start:batch_end], emb_i)
-                    
-                    # Find valid edges in this batch (vectorized filtering)
-                    valid_mask = similarities_batch > self.similarity_threshold
-                    valid_indices = np.where(valid_mask)[0]
-                    
-                    if len(valid_indices) > 0:
-                        # Get valid similarities and compute weights (vectorized)
-                        valid_similarities = similarities_batch[valid_mask]
-                        weights_batch = 1.0 / (1.0 - valid_similarities + epsilon)
-                        
-                        # Get corresponding j indices
-                        valid_j_indices = batch_start + valid_indices
-                        
-                        # Add edges to list
-                        for j, weight in zip(valid_j_indices, weights_batch):
-                            edges.append((i, j, weight))
-            
-            return edges
-        
-        # Process chunks in parallel
-        if n_jobs == -1:
-            import multiprocessing
-            n_jobs = multiprocessing.cpu_count()
-        
-        chunk_starts = list(range(0, n_items, chunk_size))
-        print(f"Step 2.2: Processing {len(chunk_starts)} chunks with {n_jobs} parallel jobs (streaming mode)...")
-        
-        # Process chunks in parallel
-        all_edges = Parallel(n_jobs=n_jobs)(delayed(process_chunk)(start) for start in chunk_starts)
-        
-        # Flatten and add edges to graph
-        total_edges = 0
-        for edge_list in all_edges:
-            total_edges += len(edge_list)
-            for i, j, w in edge_list:
-                nk_graph.addEdge(int(i), int(j), float(w))
-        
-        # Print graph statistics
-        num_nodes = nk_graph.numberOfNodes()
-        num_edges = nk_graph.numberOfEdges()
-        print(f"Step 2.2: Graph created: {num_nodes} nodes, {num_edges} edges")
-        if num_nodes > 0:
-            avg_degree = (2 * num_edges) / num_nodes
-            sparsity = 1.0 - (2 * num_edges) / (num_nodes * (num_nodes - 1))
-            print(f"  Average degree: {avg_degree:.2f}, Graph sparsity: {sparsity:.4f}")
-        
-        return nk_graph
+        return create_graph_from_embeddings_streaming_chunked(
+            embeddings,
+            similarity_threshold=self.similarity_threshold,
+            chunk_size=chunk_size,
+            batch_size=batch_size,
+            n_jobs=n_jobs
+        )
+
+    def create_graph_from_embeddings_faiss_hnsw(self,
+                                                embeddings: np.ndarray,
+                                                k: int = 30,
+                                                ef_construction: int = 200,
+                                                ef_search: int = 100,
+                                                hnsw_m: int = 16) -> nk.Graph:
+        """
+        Create NetworKit graph using FAISS IndexHNSWFlat (approximate k-NN).
+        """
+        return create_graph_from_embeddings_faiss_hnsw(
+            embeddings,
+            similarity_threshold=self.similarity_threshold,
+            k=k,
+            ef_construction=ef_construction,
+            ef_search=ef_search,
+            hnsw_m=hnsw_m
+        )
+
+    def create_graph_from_embeddings_faiss_flatip(self,
+                                                  embeddings: np.ndarray,
+                                                  k: int = 30) -> nk.Graph:
+        """
+        Create NetworKit graph using FAISS IndexFlatIP (exact k-NN).
+        """
+        return create_graph_from_embeddings_faiss_flatip(
+            embeddings,
+            similarity_threshold=self.similarity_threshold,
+            k=k
+        )
 
     def detect_communities(self, nk_graph: nk.Graph) -> Tuple[List[Set[int]], float]:
         """
@@ -280,31 +177,7 @@ class HierarchicalSequentialClustering:
         Returns:
             Tuple of (List of sets containing node IDs in communities, modularity score)
         """
-        try:
-            # Use NetworKit's Louvain algorithm for community detection
-            louvain = nk.community.PLM(nk_graph, refine=True)
-            louvain.run()
-            
-            # Get the partition
-            partition = louvain.getPartition()
-            
-            # Calculate modularity score
-            modularity = nk.community.Modularity().getQuality(partition, nk_graph)
-            
-            # Convert partition to communities
-            communities = {}
-            for node in range(nk_graph.numberOfNodes()):
-                community_id = partition[node]
-                if community_id not in communities:
-                    communities[community_id] = set()
-                communities[community_id].add(node)
-            
-            return list(communities.values()), modularity
-            
-        except Exception as e:
-            print(f"NetworKit community detection failed: {e}")
-            # Fallback: return all nodes as a single community with low modularity
-            return [set(range(nk_graph.numberOfNodes()))], 0.0
+        return detect_communities(nk_graph)
     
     def recursive_clustering(self, nk_graph: nk.Graph, cluster_id: str = "1", 
                            node_mapping: Dict[int, int] = None) -> Dict[str, List[int]]:
@@ -328,108 +201,25 @@ class HierarchicalSequentialClustering:
         Returns:
             Dictionary mapping cluster IDs to lists of original node IDs
         """
-
-        print(f"  Cluster {cluster_id}: Recursively clustering subgraph")
-        print(f"  Cluster {cluster_id}: Number of nodes: {nk_graph.numberOfNodes()}")
-        print(f"  Cluster {cluster_id}: Number of edges: {nk_graph.numberOfEdges()}")
-        
-        # If no mapping provided, create identity mapping
-        if node_mapping is None:
-            node_mapping = {i: i for i in range(nk_graph.numberOfNodes())}
-        
-        # Get original node IDs
-        original_nodes = [node_mapping[i] for i in range(nk_graph.numberOfNodes())]
-        
-        # Base case 1: if graph has < min_cluster_size nodes, stop recursion
-        if len(original_nodes) < self.min_cluster_size:
-            print(f"  Cluster {cluster_id}: Stopping recursion - {len(original_nodes)} nodes < {self.min_cluster_size} (min size)")
-            return {cluster_id: original_nodes}
-        
-        # Detect communities in current graph using NetworKit
-        communities, modularity = self.detect_communities(nk_graph)
-        
-        print(f"  Cluster {cluster_id}: {len(original_nodes)} nodes, modularity = {modularity:.3f}")
-        
-        # Base case 2: if modularity is below threshold, stop recursion
-        if modularity < self.min_modularity:
-            print(f"  Cluster {cluster_id}: Stopping recursion - modularity {modularity:.3f} < {self.min_modularity} (min modularity)")
-            return {cluster_id: original_nodes}
-        
-        # Base case 3: if only one community found or community detection failed, stop recursion
-        if len(communities) <= 1:
-            print(f"  Cluster {cluster_id}: Stopping recursion - only {len(communities)} community found")
-            return {cluster_id: original_nodes}
-        
-        print(f"  Cluster {cluster_id}: Splitting into {len(communities)} subcommunities")
-        print(f"  Cluster {cluster_id}: Processing communities sequentially (memory-efficient mode)")
-        
-        # STRATEGY 2: Process communities sequentially - one subgraph at a time
-        # This reduces peak memory by only keeping one subgraph in memory at a time
-        result = {}
-        for i, community in enumerate(communities):
-            # Community nodes are in the current graph's coordinate system (not original IDs)
-            # We need to use them directly for create_subgraph, but convert to original IDs for final results
-            
-            # Drop subgraphs that are too small and treat them as noise
-            if len(community) < self.min_graph_size:
-                print(f"  Cluster {cluster_id}.{i + 1}: Ignoring cluster and treating it as noise - {len(community)} nodes < {self.min_graph_size} (min graph size)")
-                continue
-
-            # Convert to original node IDs for size check and final results
-            original_community_nodes = {node_mapping[node] for node in community}
-
-            # If the sub-community is too small, stop recursion and keep as final cluster
-            if len(original_community_nodes) < self.min_cluster_size:
-                print(f"  Cluster {cluster_id}.{i + 1}: Stopping recursion and keeping as final cluster - {len(original_community_nodes)} nodes < {self.min_cluster_size} (min cluster size)")
-                sub_cluster_id = f"{cluster_id}.{i + 1}"
-                result[sub_cluster_id] = sorted(original_community_nodes)
-                continue
-
-            # Generate hierarchical cluster ID
-            sub_cluster_id = f"{cluster_id}.{i + 1}"
-            
-            # Create subgraph using community nodes in CURRENT graph's coordinate system
-            # (community is already in the correct coordinate system for nk_graph)
-            print(f"  Cluster {sub_cluster_id}: Creating subgraph for {len(community)} nodes")
-            nk_subgraph, reverse_mapping = self.create_subgraph(nk_graph, community)
-            
-            # Compose reverse_mapping with node_mapping to get mapping to original node IDs
-            # reverse_mapping: new_subgraph_node_id → current_graph_node_id
-            # node_mapping: current_graph_node_id → original_node_id
-            # composed_mapping: new_subgraph_node_id → original_node_id
-            composed_mapping = {
-                new_id: node_mapping[reverse_mapping[new_id]] 
-                for new_id in range(nk_subgraph.numberOfNodes())
-            }
-            
-            try:
-                # Recursively cluster the subgraph with composed mapping to original node IDs
-                print(f"  Cluster {sub_cluster_id}: Recursively clustering subgraph")
-                sub_result = self.recursive_clustering(nk_subgraph, sub_cluster_id, composed_mapping)
-                
-                # If recursion produced no clusters (e.g., all sub-communities were filtered as noise),
-                # keep the current subgraph as a final cluster so nodes are not lost.
-                if not sub_result:
-                    result[sub_cluster_id] = sorted(original_community_nodes)
-                else:
-                    result.update(sub_result)
-            
-            finally:
-                # CRITICAL: Explicitly clean up subgraph to free memory immediately
-                # Delete references to allow garbage collection
-                del nk_subgraph
-                del reverse_mapping
-                del composed_mapping
-                
-                # Force garbage collection to free memory immediately
-                # This ensures only one subgraph exists in memory at a time
-                gc.collect()
-                
-                print(f"  Cluster {sub_cluster_id}: Subgraph destroyed, memory freed")
-        
-        return result
+        return recursive_clustering(
+            nk_graph=nk_graph,
+            cluster_id=cluster_id,
+            node_mapping=node_mapping,
+            min_cluster_size=self.min_cluster_size,
+            min_modularity=self.min_modularity,
+            min_graph_size=self.min_graph_size
+        )
     
-    def fit_predict(self, embeddings: np.ndarray, batch_size: int = 1000) -> Dict[str, List[int]]:
+    def fit_predict(self,
+                    embeddings: np.ndarray,
+                    batch_size: int = 1000,
+                    graph_method: str = "auto",
+                    k: int = 30,
+                    chunk_size: int = 4096,
+                    n_jobs: int = 4,
+                    ef_construction: int = 200,
+                    ef_search: int = 100,
+                    hnsw_m: int = 16) -> Dict[str, List[int]]:
         """
         Main method to perform hierarchical clustering on embeddings using sequential subgraph processing.
         
@@ -446,6 +236,15 @@ class HierarchicalSequentialClustering:
                        Larger batches = more memory but faster computation
                        Smaller batches = less memory but slower computation
                        Adjust based on available memory and desired speed
+            graph_method: Graph construction method.
+                          Options: "auto", "streaming", "streaming-chunked",
+                          "faiss-hnsw", "faiss-flat"
+            k: k-NN size for FAISS methods
+            chunk_size: Chunk size for streaming-chunked method
+            n_jobs: Parallel jobs for streaming-chunked method
+            ef_construction: HNSW build parameter (FAISS)
+            ef_search: HNSW search parameter (FAISS)
+            hnsw_m: HNSW M parameter (FAISS)
             
         Returns:
             Dictionary mapping cluster IDs to lists of node IDs
@@ -454,21 +253,53 @@ class HierarchicalSequentialClustering:
         print(f"  Using SEQUENTIAL SUBGRAPH PROCESSING (memory-efficient, batch_size={batch_size})")
         print(f"  Memory optimization: Only one subgraph in memory at a time per recursion level")
         
-        print("Step 2: Creating NetworKit graph from embeddings (batched streaming mode)...")
-        
-        # Automatically choose between single-threaded and parallel chunked processing
-        # Based on dataset size
-        if embeddings.shape[0] > 4096*8:
-            print("Step 2.1: Using parallel chunked streaming (large dataset)")
-            nk_graph = self.create_graph_from_embeddings_streaming_chunked(
-                embeddings, 
-                chunk_size=4096,
-                batch_size=batch_size,
-                n_jobs=4
-            )
-        else:
+        print("Step 2: Creating NetworKit graph from embeddings...")
+
+        if graph_method == "auto":
+            # Automatically choose between single-threaded and parallel chunked processing
+            # Based on dataset size
+            if embeddings.shape[0] > 4096 * 8:
+                print("Step 2.1: Using parallel chunked streaming (large dataset)")
+                nk_graph = self.create_graph_from_embeddings_streaming_chunked(
+                    embeddings,
+                    chunk_size=chunk_size,
+                    batch_size=batch_size,
+                    n_jobs=n_jobs
+                )
+            else:
+                print("Step 2.1: Using single-threaded streaming")
+                nk_graph = self.create_graph_from_embeddings_streaming(embeddings, batch_size=batch_size)
+        elif graph_method == "streaming":
             print("Step 2.1: Using single-threaded streaming")
             nk_graph = self.create_graph_from_embeddings_streaming(embeddings, batch_size=batch_size)
+        elif graph_method == "streaming-chunked":
+            print("Step 2.1: Using parallel chunked streaming")
+            nk_graph = self.create_graph_from_embeddings_streaming_chunked(
+                embeddings,
+                chunk_size=chunk_size,
+                batch_size=batch_size,
+                n_jobs=n_jobs
+            )
+        elif graph_method == "faiss-hnsw":
+            print("Step 2.1: Using FAISS HNSW (approximate k-NN)")
+            nk_graph = self.create_graph_from_embeddings_faiss_hnsw(
+                embeddings,
+                k=k,
+                ef_construction=ef_construction,
+                ef_search=ef_search,
+                hnsw_m=hnsw_m
+            )
+        elif graph_method == "faiss-flat":
+            print("Step 2.1: Using FAISS FlatIP (exact k-NN)")
+            nk_graph = self.create_graph_from_embeddings_faiss_flatip(
+                embeddings,
+                k=k
+            )
+        else:
+            raise ValueError(
+                f"Unknown graph_method: {graph_method}. "
+                "Use 'auto', 'streaming', 'streaming-chunked', 'faiss-hnsw', or 'faiss-flat'."
+            )
         
         # Additional graph statistics
         num_nodes = nk_graph.numberOfNodes()
